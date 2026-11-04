@@ -180,7 +180,7 @@ static int qemu_chr_write_buffer(Chardev *s,
          * method, thus we'll log the remainder at that time.
          */
         qemu_chr_write_log(s, buf, *offset);
-    } else if (res < 0) {
+    } else if (res < 0 && errno != EAGAIN) {
         /*
          * If a fatal error was reported by the backend,
          * assume this method won't be invoked again with

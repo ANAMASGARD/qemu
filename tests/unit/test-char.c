@@ -1750,6 +1750,109 @@ static void char_file_test(void)
     char_file_test_internal(NULL, NULL);
 }
 
+#ifndef _WIN32
+static void char_socket_log_test(void)
+{
+    g_autofree char *tmp_path = g_dir_make_tmp("qemu-test-char.XXXXXX", NULL);
+    g_autofree char *logfile = g_build_filename(tmp_path, "log", NULL);
+    g_autofree char *optstr = NULL;
+    g_autofree char *contents = NULL;
+    g_autoptr(GString) expected = g_string_new(NULL);
+    CharFrontend fe;
+    Chardev *chr;
+    QemuOpts *opts;
+    char buf[4096], received[4096];
+    gsize length, remaining;
+    int fds[2], ret, sndbuf = 4096;
+
+    g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), ==, 0);
+    g_assert_cmpint(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF,
+                             &sndbuf, sizeof(sndbuf)), ==, 0);
+    optstr = g_strdup_printf("socket,id=socket-log,fd=%d,server=off,logfile=%s",
+                            fds[0], logfile);
+    opts = qemu_opts_parse_noisily(qemu_find_opts("chardev"), optstr, true);
+    g_assert_nonnull(opts);
+    chr = qemu_chr_new_from_opts(opts, NULL, &error_abort);
+    qemu_opts_del(opts);
+    qemu_chr_fe_init(&fe, chr, &error_abort);
+
+    /* Fill the socket without consuming any output, including short writes. */
+    memset(buf, 'a', sizeof(buf));
+    while ((ret = qemu_chr_fe_write(&fe, (uint8_t *)buf, sizeof(buf))) > 0) {
+        g_string_append_len(expected, buf, ret);
+        g_assert_cmpuint(expected->len, <, 1024 * 1024);
+    }
+    g_assert_cmpint(ret, ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+    g_assert_cmpuint(expected->len, >, 0);
+
+    /* A failed nonblocking write must not add bytes to the log. */
+    g_assert_true(g_file_get_contents(logfile, &contents, &length, NULL));
+    g_assert_cmpmem(contents, length, expected->str, expected->len);
+    g_clear_pointer(&contents, g_free);
+
+    remaining = expected->len;
+    while (remaining) {
+        ret = recv(fds[1], received, MIN(remaining, sizeof(received)), 0);
+        g_assert_cmpint(ret, >, 0);
+        g_assert_cmpmem(received, ret, buf, ret);
+        remaining -= ret;
+    }
+
+    /* Retry the rejected buffer: both destinations must receive it once. */
+    ret = qemu_chr_fe_write(&fe, (uint8_t *)buf, sizeof(buf));
+    g_assert_cmpint(ret, ==, sizeof(buf));
+    g_string_append_len(expected, buf, ret);
+    remaining = sizeof(buf);
+    while (remaining) {
+        ret = recv(fds[1], received, remaining, 0);
+        g_assert_cmpint(ret, >, 0);
+        g_assert_cmpmem(received, ret, buf, ret);
+        remaining -= ret;
+    }
+    g_assert_true(g_file_get_contents(logfile, &contents, &length, NULL));
+    g_assert_cmpmem(contents, length, expected->str, expected->len);
+
+    qemu_chr_fe_deinit(&fe, true);
+    close(fds[1]);
+    g_unlink(logfile);
+    g_rmdir(tmp_path);
+}
+
+static void char_socket_log_disconnected_test(void)
+{
+    g_autofree char *tmp_path = g_dir_make_tmp("qemu-test-char.XXXXXX", NULL);
+    g_autofree char *logfile = g_build_filename(tmp_path, "log", NULL);
+    g_autofree char *sockfile = g_build_filename(tmp_path, "sock", NULL);
+    g_autofree char *optstr = g_strdup_printf(
+        "socket,id=socket-log,path=%s,server=on,wait=off,logfile=%s",
+        sockfile, logfile);
+    g_autofree char *contents = NULL;
+    CharFrontend fe;
+    Chardev *chr;
+    QemuOpts *opts;
+    gsize length;
+    int ret;
+
+    opts = qemu_opts_parse_noisily(qemu_find_opts("chardev"), optstr, true);
+    g_assert_nonnull(opts);
+    chr = qemu_chr_new_from_opts(opts, NULL, &error_abort);
+    qemu_opts_del(opts);
+    qemu_chr_fe_init(&fe, chr, &error_abort);
+
+    /* Logging must still work when there is no console client. */
+    ret = qemu_chr_fe_write(&fe, (const uint8_t *)"hello", 5);
+    g_assert_cmpint(ret, ==, -1);
+    g_assert_cmpint(errno, ==, EIO);
+    g_assert_true(g_file_get_contents(logfile, &contents, &length, NULL));
+    g_assert_cmpmem(contents, length, "hello", 5);
+
+    qemu_chr_fe_deinit(&fe, true);
+    g_unlink(logfile);
+    g_rmdir(tmp_path);
+}
+#endif
+
 static void char_null_test(void)
 {
     Error *err = NULL;
@@ -1918,6 +2021,9 @@ int main(int argc, char **argv)
     g_test_add_func("/char/file", char_file_test);
 #ifndef _WIN32
     g_test_add_func("/char/file-fifo", char_file_fifo_test);
+    g_test_add_func("/char/socket/log", char_socket_log_test);
+    g_test_add_func("/char/socket/log-disconnected",
+                    char_socket_log_disconnected_test);
 #endif
 
 #define SOCKET_SERVER_TEST(name, addr)                                  \
